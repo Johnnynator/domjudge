@@ -290,7 +290,7 @@ class ImportExportService
             $problemName  = $problemData['name'] ?? $problemData['short-name'] ?? $problemData['id'] ?? null;
             $problemLabel = $problemData['label'] ?? $problemData['letter'] ?? null;
 
-            $problem = new Problem();
+            $problem = $this->em->getRepository(Problem::class)->findOneBy(['name' => $problemName]) ?: new Problem();
             $problem
                 ->setName($problemName)
                 ->setTimelimit($problemData['time_limit'] ?? 10)
@@ -299,7 +299,7 @@ class ImportExportService
             $this->em->persist($problem);
             $this->em->flush();
 
-            $contestProblem = new ContestProblem();
+            $contestProblem = $this->em->getRepository(ContestProblem::class)->findOneBy(['shortname' => $problemLabel, 'problem' => $problem, 'contest' => $contest]) ?: new ContestProblem();
             $contestProblem
                 ->setShortname($problemLabel)
                 ->setColor($problemData['rgb'] ?? $problemData['color'] ?? null)
