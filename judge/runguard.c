@@ -269,7 +269,8 @@ void error(int errnum, const char *format, ...)
 			errpos += strlen(errstr+errpos);
 			errnum = errno;
 		}
-		if ( errnum>=ECGROUPNOTCOMPILED && errnum<=ECGROUPNOTCOMPILED ) {
+        // ECGNOVERSIONCONVERT
+		if ( errnum>=ECGROUPNOTCOMPILED && errnum<=ECGNONEMPTY ) {
 			snprintf(errstr+errpos,errlen-errpos,": %s",cgroup_strerror(errnum));
 		} else {
 			snprintf(errstr+errpos,errlen-errpos,": %s",strerror(errnum));
