@@ -70,6 +70,9 @@
 #define PROGRAM "runguard"
 #define VERSION DOMJUDGE_VERSION "/" REVISION
 
+#define SYSTEMD_SLICE "domjudge.slice"
+#define SYSTEMD_SCOPE "runguard.scope"
+
 #define max(x,y) ((x) > (y) ? (x) : (y))
 #define min(x,y) ((x) < (y) ? (x) : (y))
 
@@ -145,6 +148,7 @@ int be_verbose;
 int be_quiet;
 int show_help;
 int show_version;
+int cgroup_v2;
 
 double walltimelimit[2], cputimelimit[2]; /* in seconds, soft and hard limits */
 int walllimit_reached, cpulimit_reached; /* 1=soft, 2=hard, 3=both limits reached */
@@ -445,22 +449,26 @@ void output_exit_time(int exitcode, double cpudiff)
 
 void check_remaining_procs()
 {
-    char path[1024];
+	char path[1024];
 
-    snprintf(path, 1023, "/sys/fs/cgroup/cpuacct%scgroup.procs", cgroupname);
-    FILE *file = fopen(path, "r");
-    if (file == NULL) {
-        error(errno, "opening cgroups file `%s'", path);
-    }
+	if(cgroup_v2) {
+		snprintf(path, 1023, "/sys/fs/cgroup/%scgroup.procs", cgroupname);
+    } else {
+		snprintf(path, 1023, "/sys/fs/cgroup/cpuacct%scgroup.procs", cgroupname);
+	}
+	FILE *file = fopen(path, "r");
+	if (file == NULL) {
+		error(errno, "opening cgroups file `%s'", path);
+	}
 
-    fseek(file, 0L, SEEK_END);
-    if (ftell(file) > 0) {
-        error(0, "found left-over processes in cgroup controller, please check!");
-    }
+	fseek(file, 0L, SEEK_END);
+	if (ftell(file) > 0) {
+		error(0, "found left-over processes in cgroup controller, please check!");
+	}
 	if (fclose(file) != 0) error(errno, "closing file `%s'", path);
 }
 
-void output_cgroup_stats(double *cputime)
+void output_cgroup_v1_stats(double *cputime)
 {
 	int ret;
 	int64_t max_usage, cpu_time_int;
@@ -486,6 +494,119 @@ void output_cgroup_stats(double *cputime)
 	cgroup_free(&cg);
 }
 
+void output_cgroup_v2_stats(double *cputime)
+{
+	int ret;
+	void * handle;
+	int64_t max_usage, max_swap_usage = 0;
+	struct cgroup *cg;
+	struct cgroup_controller *cg_controller;
+	struct cgroup_stat stat;
+
+	if ( (cg = cgroup_new_cgroup(cgroupname))==NULL ) error(0,"cgroup_new_cgroup");
+	if ((ret = cgroup_get_cgroup(cg)) != 0) error(ret,"get cgroup information");
+
+	cg_controller = cgroup_get_controller(cg, "memory");
+	ret = cgroup_get_value_int64(cg_controller, "memory.peak", &max_usage);
+	if ( ret == ECGROUPVALUENOTEXIST ) {
+		write_meta("intnernal-warning", "Kernel too old and does not support memory.peak");
+	} else if ( ret!=0 ) {
+		error(ret,"get cgroup value memory.peak");
+	}
+	ret = cgroup_get_value_int64(cg_controller, "memory.swap.peak", &max_swap_usage);
+	if ( ret == ECGROUPVALUENOTEXIST ) {
+		write_meta("internal-warning", "Kernel too old and does not support memory.swap.peak");
+	} else if ( ret!=0 ) {
+		error(ret,"get cgroup value memory.swap.peak");
+	}
+	verbose("total memory used: %" PRId64 " kB", (max_usage + max_swap_usage)/1024);
+	write_meta("memory-bytes","%" PRId64, max_usage + max_swap_usage);
+
+	ret = cgroup_read_stats_begin("cpu", cgroupname, &handle, &stat);
+	while(ret == 0) {
+		if(strcmp(stat.name, "usage_usec") == 0) {
+			long long usec = strtoll(stat.value, NULL, 10);
+			*cputime = usec / 1e6;
+		}
+		ret = cgroup_read_stats_next(&handle, &stat);
+	}
+	if ( ret!=ECGEOF ) error(ret,"get cgroup value cpu.stat");
+	cgroup_read_stats_end(&handle);
+
+	cgroup_free(&cg);
+}
+
+void output_cgroup_stats(double *cputime)
+{
+	if(cgroup_v2) {
+		output_cgroup_v2_stats(cputime);
+	} else {
+		output_cgroup_v1_stats(cputime);
+	}
+}
+
+#if(defined(CGROUP_VER_MAJOR) && CGROUP_VER_MAJOR >= 3)
+void cgroup_systemd_move_pid(char* scope)
+{
+	struct cgroup *cg;
+	int ret;
+	pid_t* pids;
+	int size = INT_MAX;
+	char idlecgroupname[255];
+	snprintf(idlecgroupname, 255, "%s/%s/libcgroup_systemd_idle_thread", SYSTEMD_SLICE, SYSTEMD_SCOPE);
+
+	cg = cgroup_new_cgroup(idlecgroupname);
+	if (!cg) error(0, "move_pid(): cgroup_new_cgroup");
+	if ( (ret = cgroup_create_cgroup(cg, 1))!=0 ) error(ret,"move_pod(): creating cgroup");
+
+	char * controller = NULL;
+	ret = cgroup_get_procs(scope, controller, &pids, &size);
+	if (ret != 0) error(ret, "move_pid(): cgroup_get_procs");
+	for(int i = 0; i < size; i++) {
+		cgroup_attach_task_pid(cg, pids[i]);
+	}
+	free(pids);
+	cgroup_free(&cg);
+}
+
+void cgroup_systemd_scope()
+{
+	int ret;
+	struct cgroup_systemd_scope_opts opts;
+	struct stat info;
+	struct cgroup *cg;
+	struct cgroup_controller *cg_controller;
+	char scope[64];
+	char sysfs_scope[255];
+	char * controllers[] = {"memory", "cpu", "cpuset", "pids" };
+	//if(!cgroup_is_systemd_enabled())
+	//      return;
+	snprintf(scope, 64, "%s/%s", SYSTEMD_SLICE, SYSTEMD_SCOPE);
+	snprintf(sysfs_scope, 255, "%s/%s", "/sys/fs/cgroup", scope);
+	if(stat(sysfs_scope, &info) == 0 && S_ISDIR(info.st_mode))
+		return;
+
+	cg = cgroup_new_cgroup(scope);
+	if (!cg) error(0, "cgroup_systemd_scope(): cgroup_new_cgroup");
+
+	for(size_t i = 0; i < sizeof(controllers) / sizeof(char*); i++) {
+		if ( (cg_controller = cgroup_add_controller(cg, controllers[i])) == NULL ) {
+			error(0, "cgroup_add_controller %s", controllers[i]);
+		}
+	}
+
+	ret = cgroup_set_default_scope_opts(&opts);
+	if (ret) error(ret, "cgroup_set_default_scope_opts");
+
+	ret = cgroup_create_scope2(cg, 0, &opts);
+	if (ret) error(ret, "cgroup_create_scope2");
+
+	cgroup_free(&cg);
+
+	cgroup_systemd_move_pid(scope);
+}
+#endif
+
 /* Temporary shorthand define for error handling. */
 #define cgroup_add_value(type,name,value) \
 	ret = cgroup_add_value_ ## type(cg_controller, name, value); \
@@ -506,8 +627,18 @@ void cgroup_create()
 		error(0,"cgroup_add_controller memory");
 	}
 
-	cgroup_add_value(int64, "memory.limit_in_bytes", memsize);
-	cgroup_add_value(int64, "memory.memsw.limit_in_bytes", memsize);
+	if(cgroup_v2) {
+		if(memsize != RLIM_INFINITY) {
+			cgroup_add_value(int64, "memory.max", memsize);
+			cgroup_add_value(int64, "memory.swap.max", memsize);
+		} else {
+			cgroup_add_value(string, "memory.max", "max");
+			cgroup_add_value(string, "memory.swap.max", "max");
+		}
+	} else {
+		cgroup_add_value(int64, "memory.limit_in_bytes", memsize);
+		cgroup_add_value(int64, "memory.memsw.limit_in_bytes", memsize);
+	}
 
 	/* Set up cpu restrictions; we pin the task to a specific set of
 	   cpus. We also give it exclusive access to those cores, and set
@@ -525,8 +656,14 @@ void cgroup_create()
 		verbose("cpuset undefined");
 	}
 
-	if ( (cg_controller = cgroup_add_controller(cg, "cpuacct"))==NULL ) {
-		error(0,"cgroup_add_controller cpuacct");
+	if ( (cg_controller = cgroup_add_controller(cg, "cpu"))==NULL ) {
+		error(0,"cgroup_add_controller cpu");
+	}
+
+    if(!cgroup_v2) {
+		if ( (cg_controller = cgroup_add_controller(cg, "cpuacct"))==NULL ) {
+			error(0,"cgroup_add_controller cpuacct");
+		}
 	}
 
 	/* Perform the actual creation of the cgroup */
@@ -557,15 +694,24 @@ void cgroup_attach()
 void cgroup_kill()
 {
 	int ret;
-	void *handle = NULL;
-	pid_t pid;
+	pid_t* pids;
+	int size = INT_MAX;
+	char * controller;
 
 	/* kill any remaining tasks, and wait for them to be gone */
-	while(1) {
-		ret = cgroup_get_task_begin(cgroupname, "memory", &handle, &pid);
-		cgroup_get_task_end(&handle);
-		if (ret == ECGEOF) break;
-		kill(pid, SIGKILL);
+	// XXX: Does this also work correctly with cgroup v1
+	if(cgroup_v2) {
+		controller = NULL;
+	} else {
+		controller = "memory";
+	}
+	while(size > 0) {
+		ret = cgroup_get_procs(cgroupname, controller, &pids, &size);
+		if (ret != 0) error(ret, "cgroup_get_procs");
+		for(int i = 0; i < size; i++) {
+			kill(pids[i], SIGKILL);
+		}
+		free(pids);
 	}
 }
 
@@ -577,7 +723,8 @@ void cgroup_delete()
 	cg = cgroup_new_cgroup(cgroupname);
 	if (!cg) error(0,"cgroup_new_cgroup");
 
-	if ( cgroup_add_controller(cg, "cpuacct")==NULL ) error(0,"cgroup_add_controller cpuacct");
+	if ( !cgroup_v2 && cgroup_add_controller(cg, "cpuacct")==NULL ) error(0,"cgroup_add_controller cpuacct");
+    if ( cgroup_add_controller(cg, "cpu")==NULL ) error(0,"cgroup_add_controller cpu");
 	if ( cgroup_add_controller(cg, "memory")==NULL ) error(0,"cgroup_add_controller memory");
 
 	if ( cpuset!=NULL && strlen(cpuset)>0 ) {
@@ -940,6 +1087,36 @@ void pump_pipes(fd_set* readfds, size_t data_read[], size_t data_passed[])
 
 }
 
+int get_cgroup_version() {
+#if(defined(CGROUP_VER_MAJOR) && CGROUP_VER_MAJOR >= 3)
+	enum cg_setup_mode_t setup_mode;
+	const struct cgroup_library_version * libcg_ver;
+	int is_v2_min, ret = 0;
+	libcg_ver = cgroup_version();
+	is_v2_min = (libcg_ver->major > 4) || (libcg_ver->major == 3 && libcg_ver->minor >= 1);
+	setup_mode = cgroup_setup_mode();
+	switch ( setup_mode )
+	{
+		case CGROUP_MODE_UNIFIED:
+			if(!is_v2_min) {
+				error(0,"libcgroup library version too old: %d.%d.%d < 3.1.0\n", libcg_ver->major, libcg_ver->minor, libcg_ver->release);
+			}
+			ret = is_v2_min;
+			break;
+		case CGROUP_MODE_HYBRID:
+		case CGROUP_MODE_LEGACY:
+			ret = 0;
+			break;
+		default:
+			ret = 0;
+	}
+	return ret;
+#else
+    return 0;
+#endif
+}
+
+
 int main(int argc, char **argv)
 {
 	sigset_t sigmask, emptymask;
@@ -1179,6 +1356,7 @@ int main(int argc, char **argv)
 	if ( ret!=0 ) {
 		error(0,"libcgroup initialization failed: %s(%d)\n", cgroup_strerror(ret), ret);
 	}
+	cgroup_v2 = get_cgroup_version();
 	/* Define the cgroup name that we will use and make sure it will
 	 * be unique. Note: group names must have slashes!
 	 */
@@ -1187,9 +1365,13 @@ int main(int argc, char **argv)
 	} else {
 		str[0] = 0;
 	}
-	snprintf(cgroupname, 255, "/domjudge/dj_cgroup_%d_%.16s_%d.%06d/",
+	snprintf(cgroupname, 255, "/%s/%s/dj_cgroup_%d_%.16s_%d.%06d/",
+	         SYSTEMD_SLICE, SYSTEMD_SCOPE,
 	         getpid(), str, (int)progstarttime.tv_sec, (int)progstarttime.tv_usec);
 
+#if(defined(CGROUP_VER_MAJOR) && CGROUP_VER_MAJOR >= 3)
+	if(cgroup_v2) cgroup_systemd_scope();
+#endif
 	cgroup_create();
 
 	if ( unshare(CLONE_FILES|CLONE_FS|CLONE_NEWIPC|CLONE_NEWNET|CLONE_NEWNS|CLONE_NEWUTS|CLONE_SYSVSEM)!=0 ) {
